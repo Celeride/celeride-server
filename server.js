@@ -84,14 +84,16 @@ function parseBusStops(rawStops) {
   return stops;
 }
 
-// Socket.IO connection handling
+// Socket.IO connection handling (Legacy - Apps now use HTTP API)
+// Note: Driver and User apps have been converted to use HTTP API endpoints
+// This WebSocket code is maintained for backward compatibility
 io.on("connection", (socket) => {
-  console.log("New client connected:", socket.id);
+  console.log("Legacy WebSocket client connected:", socket.id);
 
   // Store socket connection
   activeConnections.set(socket.id, { socket, type: "unknown", busId: null });
 
-  // Bus driver location update
+  // Bus driver location update (Legacy - now handled by POST /api/location)
   socket.on("driver_location_update", (data) => {
     if (!data.latitude || !data.longitude || !data.busId) {
       console.warn("Invalid location data:", data);
@@ -227,7 +229,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // Enhanced bus route update with proper stop parsing
+  // Enhanced bus route update (Legacy - now handled by POST /api/routes)
   socket.on("bus_route_update", (data) => {
     console.log("=== ENHANCED BUS ROUTE UPDATE ===");
     console.log(`DRIVER ID: ${data.deviceId}`);
@@ -289,7 +291,7 @@ io.on("connection", (socket) => {
     console.log(`✅ Enhanced route and stops updated for bus ${busId}`);
   });
 
-  // New: Handle bus stops update specifically
+  // Bus stops update (Legacy - now handled by POST /api/buses/:id/stops) 
   socket.on("bus_stops_update", (data) => {
     console.log("=== BUS STOPS UPDATE ===");
     console.log("Received stops data:", data);
@@ -405,6 +407,102 @@ io.on("connection", (socket) => {
 });
 
 // Enhanced API Routes
+
+// Location update endpoint (replaces WebSocket driver_location_update)
+app.post("/api/location", (req, res) => {
+  try {
+    const {
+      deviceId,
+      busId,
+      latitude,
+      longitude,
+      accuracy,
+      heading,
+      speed,
+      timestamp,
+      localTime,
+      backgroundUpdate,
+      source
+    } = req.body;
+
+    // Validate required fields
+    if (!deviceId || !busId || !latitude || !longitude) {
+      return res.status(400).json({ 
+        error: "Missing required fields: deviceId, busId, latitude, longitude" 
+      });
+    }
+
+    console.log("📍 HTTP Location update received:", {
+      deviceId,
+      busId,
+      latitude,
+      longitude,
+      timestamp,
+      localTime,
+      speed,
+      source: source || 'http-api'
+    });
+
+    const serverTimestamp = new Date().toISOString();
+
+    // Track device if deviceId is provided
+    if (deviceId) {
+      activeDevices.set(deviceId, {
+        busId,
+        lastSeen: timestamp || serverTimestamp,
+      });
+    }
+
+    // Store or update the active bus
+    activeBuses.set(busId, {
+      deviceId: deviceId || "unknown",
+      busId,
+      latitude: parseFloat(latitude),
+      longitude: parseFloat(longitude),
+      accuracy: parseFloat(accuracy) || null,
+      heading: parseFloat(heading) || null,
+      speed: parseFloat(speed) || 0,
+      lastUpdate: timestamp || serverTimestamp,
+      serverReceivedAt: serverTimestamp,
+      localTime: localTime,
+      backgroundUpdate: backgroundUpdate || false,
+      source: source || 'http-api'
+    });
+
+    // Broadcast the update to any connected WebSocket clients (if any)
+    const busStopsData = busStops.get(busId) || [];
+    io.emit("bus_location_update", {
+      deviceId: deviceId || "unknown",
+      busId,
+      latitude: parseFloat(latitude),
+      longitude: parseFloat(longitude),
+      accuracy: parseFloat(accuracy) || null,
+      heading: parseFloat(heading) || null,
+      speed: parseFloat(speed) || 0,
+      lastUpdate: timestamp || serverTimestamp,
+      serverReceivedAt: serverTimestamp,
+      localTime: localTime,
+      busStops: busStopsData,
+      source: source || 'http-api'
+    });
+
+    res.json({
+      success: true,
+      message: "Location updated successfully",
+      busId,
+      deviceId,
+      timestamp: serverTimestamp
+    });
+
+    console.log(`✅ Location updated for bus ${busId} from HTTP API`);
+  } catch (error) {
+    console.error("❌ Error processing location update:", error);
+    res.status(500).json({ 
+      error: "Failed to process location update",
+      details: error.message 
+    });
+  }
+});
 
 // Get all active buses with stops
 app.get("/api/buses", (req, res) => {
