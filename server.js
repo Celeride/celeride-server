@@ -497,9 +497,11 @@ app.post("/api/location", async (req, res) => {
     console.log(`✅ Location updated for bus ${busId} from HTTP API`);
   } catch (error) {
     console.error("❌ Error processing location update:", error);
+    console.error("❌ Error stack:", error.stack);
     res.status(500).json({ 
       error: "Failed to process location update",
-      details: error.message 
+      details: error.message,
+      stack: error.stack 
     });
   }
 });

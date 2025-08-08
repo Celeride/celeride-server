@@ -70,7 +70,7 @@ const db = {
           server_received_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
           local_time TIMESTAMP,
           background_update BOOLEAN DEFAULT FALSE,
-          source VARCHAR(20) DEFAULT 'http-api'
+          source VARCHAR(50) DEFAULT 'http-api'
         )
       `);
 
@@ -130,6 +130,12 @@ const db = {
         CREATE INDEX IF NOT EXISTS idx_proximity_events_stop_id ON proximity_events(stop_id);
       `);
 
+      // Migrate existing source column to accommodate longer values
+      await client.query(`
+        ALTER TABLE active_buses 
+        ALTER COLUMN source TYPE VARCHAR(50)
+      `);
+
       await client.query('COMMIT');
       console.log('✅ Database tables initialized successfully');
     } catch (error) {
@@ -143,6 +149,7 @@ const db = {
 
   // Bus operations
   async updateBusLocation(busData) {
+    console.log('🔍 Attempting to update bus location:', busData);
     const client = await pool.connect();
     try {
       const {
@@ -150,6 +157,8 @@ const db = {
         timestamp, localTime, backgroundUpdate, source
       } = busData;
 
+      console.log('🔍 Executing database query with params:', [busId, deviceId, latitude, longitude, accuracy, heading, speed, timestamp, localTime, backgroundUpdate, source]);
+      
       const result = await client.query(`
         INSERT INTO active_buses (
           bus_id, device_id, latitude, longitude, accuracy, heading, speed,
@@ -169,11 +178,17 @@ const db = {
           source = EXCLUDED.source
         RETURNING *
       `, [busId, deviceId, latitude, longitude, accuracy, heading, speed, timestamp, localTime, backgroundUpdate, source]);
+      
+      console.log('✅ Database query executed successfully');
 
       // Check for proximity to bus stops
       await this.checkBusStopProximity(busId, latitude, longitude, deviceId);
 
       return result.rows[0];
+    } catch (error) {
+      console.error('❌ Database error in updateBusLocation:', error);
+      console.error('❌ Database error stack:', error.stack);
+      throw error;
     } finally {
       client.release();
     }
