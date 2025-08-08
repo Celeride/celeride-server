@@ -15,6 +15,7 @@ const cors = require("cors");
 const path = require("path");
 const AIAgent = require("./ai-agent");
 const ContextManager = require("./context-manager");
+const db = require("./database");
 
 // Create Express app and HTTP server
 const app = express();
@@ -409,7 +410,7 @@ io.on("connection", (socket) => {
 // Enhanced API Routes
 
 // Location update endpoint (replaces WebSocket driver_location_update)
-app.post("/api/location", (req, res) => {
+app.post("/api/location", async (req, res) => {
   try {
     const {
       deviceId,
@@ -443,34 +444,33 @@ app.post("/api/location", (req, res) => {
       source: source || 'http-api'
     });
 
-    const serverTimestamp = new Date().toISOString();
-
-    // Track device if deviceId is provided
-    if (deviceId) {
-      activeDevices.set(deviceId, {
-        busId,
-        lastSeen: timestamp || serverTimestamp,
-      });
-    }
-
-    // Store or update the active bus
-    activeBuses.set(busId, {
-      deviceId: deviceId || "unknown",
+    // Store location in database (includes proximity checking)
+    const updatedBus = await db.updateBusLocation({
+      deviceId,
       busId,
       latitude: parseFloat(latitude),
       longitude: parseFloat(longitude),
       accuracy: parseFloat(accuracy) || null,
       heading: parseFloat(heading) || null,
       speed: parseFloat(speed) || 0,
-      lastUpdate: timestamp || serverTimestamp,
-      serverReceivedAt: serverTimestamp,
-      localTime: localTime,
+      timestamp: timestamp || new Date().toISOString(),
+      localTime,
       backgroundUpdate: backgroundUpdate || false,
       source: source || 'http-api'
     });
 
+    // Track device in memory for legacy compatibility
+    if (deviceId) {
+      activeDevices.set(deviceId, {
+        busId,
+        lastSeen: timestamp || new Date().toISOString(),
+      });
+    }
+
+    // Get bus stops from database for WebSocket broadcast
+    const busStopsData = await db.getBusStops(busId);
+
     // Broadcast the update to any connected WebSocket clients (if any)
-    const busStopsData = busStops.get(busId) || [];
     io.emit("bus_location_update", {
       deviceId: deviceId || "unknown",
       busId,
@@ -479,8 +479,8 @@ app.post("/api/location", (req, res) => {
       accuracy: parseFloat(accuracy) || null,
       heading: parseFloat(heading) || null,
       speed: parseFloat(speed) || 0,
-      lastUpdate: timestamp || serverTimestamp,
-      serverReceivedAt: serverTimestamp,
+      lastUpdate: timestamp || new Date().toISOString(),
+      serverReceivedAt: updatedBus.server_received_at,
       localTime: localTime,
       busStops: busStopsData,
       source: source || 'http-api'
@@ -491,7 +491,7 @@ app.post("/api/location", (req, res) => {
       message: "Location updated successfully",
       busId,
       deviceId,
-      timestamp: serverTimestamp
+      timestamp: updatedBus.server_received_at
     });
 
     console.log(`✅ Location updated for bus ${busId} from HTTP API`);
@@ -505,84 +505,104 @@ app.post("/api/location", (req, res) => {
 });
 
 // Get all active buses with stops
-app.get("/api/buses", (req, res) => {
-  const activeBusesArray = Array.from(activeBuses.values());
-  const busRoutesArray = Array.from(busRoutes.values());
-
-  // Enhance buses with stops data
-  const enhancedBuses = activeBusesArray.map((bus) => ({
-    ...bus,
-    busStops: busStops.get(bus.busId) || [],
-  }));
-
-  res.json({
-    activeBuses: enhancedBuses,
-    busRoutes: busRoutesArray,
-    busStops: Object.fromEntries(busStops),
-  });
+app.get("/api/buses", async (req, res) => {
+  try {
+    const activeBuses = await db.getActiveBuses();
+    
+    res.json({
+      activeBuses: activeBuses,
+      busRoutes: [], // Legacy field - routes are now included in bus data
+      busStops: {} // Legacy field - stops are now included in bus data
+    });
+  } catch (error) {
+    console.error("❌ Error fetching buses:", error);
+    res.status(500).json({ error: "Failed to fetch buses" });
+  }
 });
 
 // Get specific bus info with stops
-app.get("/api/buses/:id", (req, res) => {
-  const busId = req.params.id;
-  const busInfo = activeBuses.get(busId);
-  const routeInfo = busRoutes.get(busId);
-  const stopsInfo = busStops.get(busId) || [];
+app.get("/api/buses/:id", async (req, res) => {
+  try {
+    const busId = req.params.id;
+    const busData = await db.getBusById(busId);
 
-  if (!busInfo && !routeInfo) {
-    return res.status(404).json({ error: "Bus not found" });
+    if (!busData) {
+      return res.status(404).json({ error: "Bus not found" });
+    }
+
+    res.json({
+      busInfo: busData,
+      routeInfo: busData,
+      busStops: busData.bus_stops || [],
+      driverId: busData.device_id,
+      parsedStops: busData.bus_stops || [],
+      stopCount: busData.bus_stops ? busData.bus_stops.length : 0,
+    });
+  } catch (error) {
+    console.error("❌ Error fetching bus:", error);
+    res.status(500).json({ error: "Failed to fetch bus data" });
   }
-
-  res.json({
-    busInfo: busInfo || null,
-    routeInfo: routeInfo || null,
-    busStops: stopsInfo,
-    driverId: routeInfo?.deviceId || busInfo?.deviceId,
-    formattedStops: routeInfo?.formattedStops,
-    parsedStops: routeInfo?.parsedStops,
-    stopCount: stopsInfo.length,
-  });
 });
 
 // New: Get bus stops for a specific bus
-app.get("/api/buses/:id/stops", (req, res) => {
-  const busId = req.params.id;
-  const stops = busStops.get(busId) || [];
+app.get("/api/buses/:id/stops", async (req, res) => {
+  try {
+    const busId = req.params.id;
+    const stops = await db.getBusStops(busId);
 
-  res.json({
-    busId: busId,
-    stops: stops,
-    count: stops.length,
-    lastUpdated: busRoutes.get(busId)?.lastUpdated || null,
-  });
+    res.json({
+      busId: busId,
+      stops: stops,
+      count: stops.length,
+      lastUpdated: stops.length > 0 ? stops[0].created_at : null,
+    });
+  } catch (error) {
+    console.error("❌ Error fetching bus stops:", error);
+    res.status(500).json({ error: "Failed to fetch bus stops" });
+  }
 });
 
 // New: Update bus stops via API
-app.post("/api/buses/:id/stops", (req, res) => {
-  const busId = req.params.id;
-  const { stops, deviceId } = req.body;
+app.post("/api/buses/:id/stops", async (req, res) => {
+  try {
+    const busId = req.params.id;
+    const { stops, deviceId } = req.body;
 
-  if (!stops || !Array.isArray(stops)) {
-    return res.status(400).json({ error: "Invalid stops data" });
+    if (!stops || !Array.isArray(stops)) {
+      return res.status(400).json({ error: "Invalid stops data" });
+    }
+
+    // Use existing route save functionality
+    await db.saveRoute({
+      busId,
+      deviceId,
+      parsedStops: parseBusStops(stops),
+      timestamp: new Date().toISOString(),
+      routeGeometry: null,
+      routeDistance: null,
+      routeDuration: null
+    });
+
+    const savedStops = await db.getBusStops(busId);
+
+    // Broadcast the update
+    io.emit("bus_stops_updated", {
+      busId: busId,
+      deviceId: deviceId,
+      stops: savedStops,
+      timestamp: new Date().toISOString(),
+    });
+
+    res.json({
+      success: true,
+      busId: busId,
+      stops: savedStops,
+      count: savedStops.length,
+    });
+  } catch (error) {
+    console.error("❌ Error updating bus stops:", error);
+    res.status(500).json({ error: "Failed to update bus stops" });
   }
-
-  const parsedStops = parseBusStops(stops);
-  busStops.set(busId, parsedStops);
-
-  // Broadcast the update
-  io.emit("bus_stops_updated", {
-    busId: busId,
-    deviceId: deviceId,
-    stops: parsedStops,
-    timestamp: new Date().toISOString(),
-  });
-
-  res.json({
-    success: true,
-    busId: busId,
-    stops: parsedStops,
-    count: parsedStops.length,
-  });
 });
 
 // Real time API
@@ -604,17 +624,28 @@ app.get("/api/time", (req, res) => {
 });
 
 // Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    activeBuses: activeBuses.size,
-    connectedClients: activeConnections.size,
-    busStops: busStops.size,
-  });
+app.get("/health", async (req, res) => {
+  try {
+    const activeBuses = await db.getActiveBuses();
+    
+    res.json({
+      status: "ok",
+      activeBuses: activeBuses.length,
+      connectedClients: activeConnections.size,
+      totalStops: activeBuses.reduce((sum, bus) => sum + (bus.bus_stops ? bus.bus_stops.length : 0), 0),
+      database: "connected"
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      database: "disconnected",
+      error: error.message
+    });
+  }
 });
 
 // Enhanced route management endpoints
-app.post("/api/routes", (req, res) => {
+app.post("/api/routes", async (req, res) => {
   try {
     const {
       busId,
@@ -624,7 +655,6 @@ app.post("/api/routes", (req, res) => {
       routeDistance,
       routeDuration,
       timestamp,
-      stopCount,
     } = req.body;
 
     if (!busId || !stops || stops.length < 2) {
@@ -634,29 +664,38 @@ app.post("/api/routes", (req, res) => {
     // Parse stops
     const parsedStops = parseBusStops(stops);
 
-    // Store route information
-    const routeData = {
+    // Save route to database
+    await db.saveRoute({
       busId,
       deviceId,
-      stops,
       parsedStops,
       routeGeometry,
       routeDistance,
       routeDuration,
-      stopCount: parsedStops.length,
+      timestamp: timestamp || new Date().toISOString(),
+    });
+
+    const savedStops = await db.getBusStops(busId);
+
+    // Broadcast to all connected clients
+    const routeData = {
+      busId,
+      deviceId,
+      stops,
+      parsedStops: savedStops,
+      routeGeometry,
+      routeDistance,
+      routeDuration,
+      stopCount: savedStops.length,
       lastUpdated: timestamp || new Date().toISOString(),
       serverReceivedAt: new Date().toISOString(),
     };
 
-    busRoutes.set(busId, routeData);
-    busStops.set(busId, parsedStops);
-
-    // Broadcast to all connected clients
     io.emit("bus_route_updated", routeData);
     io.emit("bus_stops_updated", {
       busId: busId,
       deviceId: deviceId,
-      stops: parsedStops,
+      stops: savedStops,
       timestamp: new Date().toISOString(),
     });
 
@@ -666,7 +705,7 @@ app.post("/api/routes", (req, res) => {
       success: true,
       message: "Route and stops saved successfully",
       routeData: routeData,
-      busStops: parsedStops,
+      busStops: savedStops,
     });
   } catch (error) {
     console.error("❌ Error saving route:", error);
@@ -675,37 +714,39 @@ app.post("/api/routes", (req, res) => {
 });
 
 // Get all routes with stops
-app.get("/api/routes", (req, res) => {
-  const routesArray = Array.from(busRoutes.values());
-  const enhancedRoutes = routesArray.map((route) => ({
-    ...route,
-    busStops: busStops.get(route.busId) || [],
-  }));
-
-  res.json({
-    routes: enhancedRoutes,
-    count: busRoutes.size,
-    totalStops: Array.from(busStops.values()).reduce(
-      (sum, stops) => sum + stops.length,
-      0,
-    ),
-  });
+app.get("/api/routes", async (req, res) => {
+  try {
+    const buses = await db.getActiveBuses();
+    
+    res.json({
+      routes: buses,
+      count: buses.length,
+      totalStops: buses.reduce((sum, bus) => sum + (bus.bus_stops ? bus.bus_stops.length : 0), 0),
+    });
+  } catch (error) {
+    console.error("❌ Error fetching routes:", error);
+    res.status(500).json({ error: "Failed to fetch routes" });
+  }
 });
 
 // Get specific route with stops
-app.get("/api/routes/:busId", (req, res) => {
-  const busId = req.params.busId;
-  const routeData = busRoutes.get(busId);
-  const stopsData = busStops.get(busId) || [];
+app.get("/api/routes/:busId", async (req, res) => {
+  try {
+    const busId = req.params.busId;
+    const busData = await db.getBusById(busId);
 
-  if (!routeData) {
-    return res.status(404).json({ error: "Route not found" });
+    if (!busData) {
+      return res.status(404).json({ error: "Route not found" });
+    }
+
+    res.json({
+      ...busData,
+      busStops: busData.bus_stops || [],
+    });
+  } catch (error) {
+    console.error("❌ Error fetching route:", error);
+    res.status(500).json({ error: "Failed to fetch route" });
   }
-
-  res.json({
-    ...routeData,
-    busStops: stopsData,
-  });
 });
 
 // Add new endpoints for conversation management
@@ -744,15 +785,55 @@ app.post("/api/context/:userId/reset", (req, res) => {
   }
 });
 
+// Get proximity events for a specific bus
+app.get("/api/buses/:id/proximity", async (req, res) => {
+  try {
+    const busId = req.params.id;
+    const limit = parseInt(req.query.limit) || 50;
+    
+    const events = await db.getProximityEvents(busId, limit);
+    
+    res.json({
+      busId,
+      proximityEvents: events,
+      count: events.length,
+    });
+  } catch (error) {
+    console.error("❌ Error fetching proximity events:", error);
+    res.status(500).json({ error: "Failed to fetch proximity events" });
+  }
+});
+
 // Default route
 app.get("/", (req, res) => {
   res.send("Enhanced Bus Tracking Server with Bus Stops Management is running");
 });
 
-// Start the server
+// Initialize database and start the server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Enhanced Bus Tracking Server running on port ${PORT}`);
-  console.log(`WebSocket server is available at ws://localhost:${PORT}`);
-  console.log(`Bus stops management enabled`);
-});
+
+async function startServer() {
+  try {
+    // Test database connection and initialize tables
+    console.log("🚀 Initializing database...");
+    const connected = await db.testConnection();
+    if (!connected) {
+      throw new Error("Failed to connect to database");
+    }
+    
+    await db.initializeTables();
+    console.log("✅ Database initialized successfully");
+
+    server.listen(PORT, () => {
+      console.log(`Enhanced Bus Tracking Server running on port ${PORT}`);
+      console.log(`WebSocket server is available at ws://localhost:${PORT}`);
+      console.log(`PostgreSQL database connected and initialized`);
+      console.log(`Bus stops management and proximity tracking enabled`);
+    });
+  } catch (error) {
+    console.error("❌ Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
