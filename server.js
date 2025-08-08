@@ -647,6 +647,8 @@ app.get("/health", async (req, res) => {
 // Enhanced route management endpoints
 app.post("/api/routes", async (req, res) => {
   try {
+    console.log("📍 Received route data:", JSON.stringify(req.body, null, 2));
+    
     const {
       busId,
       deviceId,
@@ -657,23 +659,39 @@ app.post("/api/routes", async (req, res) => {
       timestamp,
     } = req.body;
 
+    console.log("📍 Route validation - busId:", busId, "stops count:", stops?.length);
+
     if (!busId || !stops || stops.length < 2) {
-      return res.status(400).json({ error: "Invalid route data" });
+      console.warn("❌ Route validation failed - busId:", busId, "stops:", stops?.length);
+      return res.status(400).json({ error: "Invalid route data - need busId and at least 2 stops" });
     }
 
-    // Parse stops
-    const parsedStops = parseBusStops(stops);
+    // Parse stops with error handling
+    let parsedStops;
+    try {
+      parsedStops = parseBusStops(stops);
+      console.log("✅ Parsed stops:", parsedStops.length);
+    } catch (parseError) {
+      console.error("❌ Stop parsing error:", parseError);
+      return res.status(400).json({ error: "Invalid stops format", details: parseError.message });
+    }
 
-    // Save route to database
-    await db.saveRoute({
-      busId,
-      deviceId,
-      parsedStops,
-      routeGeometry,
-      routeDistance,
-      routeDuration,
-      timestamp: timestamp || new Date().toISOString(),
-    });
+    // Save route to database with error handling
+    try {
+      await db.saveRoute({
+        busId,
+        deviceId,
+        parsedStops,
+        routeGeometry,
+        routeDistance,
+        routeDuration,
+        timestamp: timestamp || new Date().toISOString(),
+      });
+      console.log("✅ Route saved to database");
+    } catch (dbError) {
+      console.error("❌ Database save error:", dbError);
+      return res.status(500).json({ error: "Failed to save route to database", details: dbError.message });
+    }
 
     const savedStops = await db.getBusStops(busId);
 

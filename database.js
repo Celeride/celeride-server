@@ -181,21 +181,43 @@ const db = {
 
   async getActiveBuses() {
     const result = await pool.query(`
-      SELECT ab.*, 
-             json_agg(
-               json_build_object(
-                 'id', bs.id,
-                 'name', bs.name,
-                 'latitude', bs.latitude,
-                 'longitude', bs.longitude,
-                 'stop_order', bs.stop_order
-               ) ORDER BY bs.stop_order
-             ) FILTER (WHERE bs.id IS NOT NULL) as bus_stops
-      FROM active_buses ab
-      LEFT JOIN bus_stops bs ON ab.bus_id = bs.bus_id
+      SELECT 
+        COALESCE(ab.bus_id, br.bus_id) as bus_id,
+        COALESCE(ab.device_id, br.device_id) as device_id,
+        ab.latitude,
+        ab.longitude,
+        ab.accuracy,
+        ab.heading,
+        ab.speed,
+        ab.last_update,
+        ab.server_received_at as location_received_at,
+        ab.local_time,
+        ab.background_update,
+        ab.source,
+        br.route_geometry,
+        br.route_distance,
+        br.route_duration,
+        br.stop_count,
+        br.last_updated as route_last_updated,
+        br.server_received_at as route_received_at,
+        json_agg(
+          json_build_object(
+            'id', bs.id,
+            'name', bs.name,
+            'latitude', bs.latitude,
+            'longitude', bs.longitude,
+            'stop_order', bs.stop_order
+          ) ORDER BY bs.stop_order
+        ) FILTER (WHERE bs.id IS NOT NULL) as bus_stops
+      FROM bus_routes br
+      FULL OUTER JOIN active_buses ab ON br.bus_id = ab.bus_id
+      LEFT JOIN bus_stops bs ON COALESCE(ab.bus_id, br.bus_id) = bs.bus_id
       GROUP BY ab.bus_id, ab.device_id, ab.latitude, ab.longitude, 
                ab.accuracy, ab.heading, ab.speed, ab.last_update, 
-               ab.server_received_at, ab.local_time, ab.background_update, ab.source
+               ab.server_received_at, ab.local_time, ab.background_update, ab.source,
+               br.bus_id, br.device_id, br.route_geometry, br.route_distance,
+               br.route_duration, br.stop_count, br.last_updated, br.server_received_at
+      ORDER BY COALESCE(ab.server_received_at, br.server_received_at) DESC
     `);
     return result.rows;
   },
